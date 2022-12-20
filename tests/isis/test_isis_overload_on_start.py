@@ -1,6 +1,8 @@
 import pytest
 import time
-from utilities.common import poll_wait
+import datetime
+import json
+from tests.common.utilities import wait_until
 
 pytestmark = [
     pytest.mark.topology('any'),
@@ -8,99 +10,145 @@ pytestmark = [
 ]
 
 
-def test_isis_overload_on_start(duthosts, enum_frontend_dut_hostname, enum_asic_index):
+def test_isis_overload_on_start(duthosts, enum_frontend_dut_hostname):
     """test basic functionality of set overload on start"""
 
     duthost = duthosts[enum_frontend_dut_hostname]
+    overload_on_startup_time = 120
 
-    bgp_facts = duthost.bgp_facts(instance_id=enum_asic_index)['ansible_facts']
-    namespace = duthost.get_namespace_from_asic_id(enum_asic_index)
-    config_facts = duthost.config_facts(host=duthost.hostname, source="running", namespace=namespace)['ansible_facts']
+    # # Verfiy isisd is running
+    assert check_isisd_running(duthost)
+
+    # Configure simple config with set overload on startup
+    frr_config = """
+    configure
+    router isis 1
+      is-type level-2-only
+      net 49.0001.1720.1700.0002.00
+      set-overload-bit on-startup {}
+    exit
+    interface PortChannel101
+      ip router isis 1
+      isis circuit-type level-2-only
+      isis network point-to-point
+      no isis hello padding
+    end
+    write memory
+    """.format(overload_on_startup_time)
+
+    vtysh_cmd = "vtysh -c \"{}\"".format(frr_config)
+    duthost.shell(vtysh_cmd)
+
+    # Restart sonic device
+    sonic_db_cmd = "sudo systemctl restart bgp"
+    duthost.shell(sonic_db_cmd)
 
     # Verfiy isisd is running
-    assert check_isisd_running()
-
-    # Configure set-overload-bit on-startup
-    sonic_db_cmd = "vtysh -c \"configure\nrouter isis 1\nset-overload-bit on-startup 120\nend\""
-    duthost.shell(sonic_db_cmd)
-
-    # Restart sonic device
-    tstamp_before_restart_router = datetime.datetime.now()
-    sonic_db_cmd = "sudo systemctl restart bgp"
-    duthost.shell(sonic_db_cmd)
-
-    assert poll_wait(check_isisd_running, 60)
-
-    tstamp_after_restart_router = datetime.datetime.now()
-    startup_router_time = (
-        tstamp_after_start_router - tstamp_before_start_router
-    ).total_seconds()
+    assert wait_until(10, 1, 0, check_isisd_running, duthost)
+    tstamp_on_startup = datetime.datetime.now()
 
     # Check that overload bit is set in the LSP
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
-    time.sleep(120)
+    assert check_lsp_overload_bit(duthost, "vlab-01.00-00", "0/0/1")
 
     # Check that overload bit is unset in the LSP
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/0")
+    assert wait_until(120, 1, 0, check_lsp_overload_bit, duthost, "vlab-01.00-00", "0/0/0")
+    tstamp_on_overload_bit_unset = datetime.datetime.now()
 
-def test_cancel_overload_timer(duthosts, enum_frontend_dut_hostname, enum_asic_index):
+    overload_time = (
+        tstamp_on_overload_bit_unset - tstamp_on_startup
+    ).total_seconds()
+    assert overload_time >= overload_on_startup_time - 1  and overload_time <= overload_on_startup_time + 1
+
+def test_cancel_overload_timer(duthosts, enum_frontend_dut_hostname):
     """test overload cancellation"""
+    duthost = duthosts[enum_frontend_dut_hostname]
+    overload_on_startup_time = 120
 
     # Configure set-overload-bit on-startup with set-overload-bit
-    sonic_db_cmd = "vtysh -c \"configure\nrouter isis 1\nset-overload-bit on-startup 120\nset-overload-bit\nend\""
-    duthost.shell(sonic_db_cmd)
+    frr_config = """
+    configure
+    router isis 1
+      set-overload-bit
+      set-overload-bit on-startup {}
+    end
+    write memory
+    """.format(overload_on_startup_time)
+
+    vtysh_cmd = "vtysh -c \"{}\"".format(frr_config)
+    duthost.shell(vtysh_cmd)
 
     # Restart sonic device
     sonic_db_cmd = "sudo systemctl restart bgp"
     duthost.shell(sonic_db_cmd)
 
-    # Wait for isisd to start up
-    assert poll_wait(check_isisd_running, 60)
+    if not wait_until(10, 1, 0, check_isisd_running, duthost):
+        sonic_db_cmd = "docker start bgp"
+        duthost.shell(sonic_db_cmd)
 
-    # Check that overload bit is set in the LSP 
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
+    # Verfiy isisd is running
+    assert wait_until(10, 1, 0, check_isisd_running, duthost)
+
+    # Check that overload bit is set in the LSP
+    assert check_lsp_overload_bit(duthost, "vlab-01.00-00", "0/0/1")
 
     # Unset overload bit while timer is running 
-    sonic_db_cmd = "vtysh -c \"configure\nrouter isis 1\nno set-overload-bit\nend\""
-    duthost.shell(sonic_db_cmd)
+    frr_config = """
+    configure
+    router isis 1
+      no set-overload-bit
+    end
+    write memory
+    """
 
+    vtysh_cmd = "vtysh -c \"{}\"".format(frr_config)
+    duthost.shell(vtysh_cmd)
+    
+    assert check_isisd_running(duthost)
     # Check that overload bit is unset
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/0")
+    tstamp_before_unset = datetime.datetime.now()
+    assert wait_until(10, 1, 0, check_lsp_overload_bit, duthost, "vlab-01.00-00", "0/0/0")
+    tstamp_after_unset = datetime.datetime.now()
 
-def test_override_overload_timer(duthosts, enum_frontend_dut_hostname, enum_asic_index):
-    """test override overload"""
-    # Configure set-overload-bit on-startup with set-overload-bit
-    sonic_db_cmd = "vtysh -c \"configure\nrouter isis 1\nset-overload-bit on-startup 60\nset-overload-bit\nend\""
-    duthost.shell(sonic_db_cmd)
+    overload_time = (
+        tstamp_after_unset - tstamp_before_unset
+    ).total_seconds()
 
-    # Restart sonic device
-    sonic_db_cmd = "sudo systemctl restart bgp"
-    duthost.shell(sonic_db_cmd)
+    logging.info(overload_time)
 
-    # Wait for isisd to start up
-    assert poll_wait(check_isisd_running, 60)
+# def test_override_overload_timer(duthosts, enum_frontend_dut_hostname, enum_asic_index):
+#     """test override overload"""
+#     # Configure set-overload-bit on-startup with set-overload-bit
+#     sonic_db_cmd = "vtysh -c \"configure\nrouter isis 1\nset-overload-bit on-startup 60\nset-overload-bit\nend\""
+#     duthost.shell(sonic_db_cmd)
 
-    # Check that overload bit is set in the LSP 
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
+#     # Restart sonic device
+#     sonic_db_cmd = "sudo systemctl restart bgp"
+#     duthost.shell(sonic_db_cmd)
 
-    # Wait for 60 seconds - enough for overload timer to run out 
-    time.sleep(60)
+#     # Wait for isisd to start up
+#     assert poll_wait(check_isisd_running, 60)
 
-    # Check that overload bit is still set in the LSP 
-    assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
+#     # Check that overload bit is set in the LSP 
+#     assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
 
-def check_isisd_running():
+#     # Wait for 60 seconds - enough for overload timer to run out 
+#     time.sleep(60)
+
+#     # Check that overload bit is still set in the LSP 
+#     assert check_lsp_overload_bit("vlab-01.00-00", "0/0/1")
+
+def check_isisd_running(duthost):
     sonic_db_cmd = "vtysh -c \"show daemons\""
     daemons = duthost.shell(sonic_db_cmd)['stdout_lines'][0]
     return "isisd" in daemons
 
-def check_lsp_overload_bit(lsp, att_p_ol_expected):
-    vtysh_cmd = "show isis database {} json".format(sp)
-    sonic_db_cmd = f"vtysh -c \"{vtysh_cmd}\""
-    output = duthost.shell(sonic_db_cmd)['stdout_lines'][0]
+def check_lsp_overload_bit(duthost, lsp, att_p_ol_expected):
+    vtysh_cmd = "show isis database {} json".format(lsp)
+    sonic_db_cmd = "vtysh -c \"{}\"".format(vtysh_cmd)
+    output = duthost.shell(sonic_db_cmd)['stdout']
     database_json = json.loads(output)
     att_p_ol = database_json["areas"][0]["levels"][1]["att-p-ol"]
-    return att_p_ol == att_p_ol_expected:
+    return att_p_ol == att_p_ol_expected
 
 
 
